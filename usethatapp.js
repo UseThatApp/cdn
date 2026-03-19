@@ -5,19 +5,31 @@
 (function () {
     'use strict';
 
+    // Do not run when loaded in a top-level context
+    if (window === window.parent) { return; }
+
     const parentOrigin = "https://usethatapp.onrender.com"; // TODO: Update to www.usethatapp.com in production
 
+    // Constants
+    const HANDSHAKE_TIMEOUT_MS = 10000; // Must stay in sync with parent app.html timeout
+    const RESIZE_DEBOUNCE_MS = 100;
+    const MAX_CONTENT_HEIGHT = 10000; // Safety cap — mirrors parent MAX_RESET_HEIGHT_PX
+
+    // Handshake state
+    // Scoped key prevents collisions when multiple same-origin apps are embedded in the same tab
+    const SESSION_KEY = `handshakeComplete_${parentOrigin}`;
+
     // Restore handshake flag from sessionStorage (persists across same-origin iframe navigations)
-    let handshakeComplete = sessionStorage.getItem('handshakeComplete') === '1';
+    let handshakeComplete = sessionStorage.getItem(SESSION_KEY) === '1';
 
     function setHandshakeComplete(value) {
         handshakeComplete = !!value;
-        sessionStorage.setItem('handshakeComplete', handshakeComplete ? '1' : '0');
+        sessionStorage.setItem(SESSION_KEY, handshakeComplete ? '1' : '0');
     }
 
     function clearHandshake() {
         handshakeComplete = false;
-        sessionStorage.removeItem('handshakeComplete');
+        sessionStorage.removeItem(SESSION_KEY);
     }
 
     /**
@@ -33,8 +45,9 @@
             return NO_UPDATE;
         }
 
-        const timeout = 10000; // milliseconds
-        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const requestId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
         return new Promise((resolve, reject) => {
             let timeoutId = null;
@@ -80,7 +93,7 @@
             timeoutId = setTimeout(() => {
                 cleanup();
                 reject(new Error('requestAccessLevel timed out'));
-            }, timeout);
+            }, HANDSHAKE_TIMEOUT_MS);
         });
     }
 
@@ -106,6 +119,8 @@
 
         switch (msg.type) {
             case 'nonce':
+                // Validate nonce is a non-empty string before echoing
+                if (!msg.nonce || typeof msg.nonce !== 'string') { return; }
                 // Acknowledge nonce to complete handshake
                 window.parent.postMessage({
                     type: 'nonce-ack',
@@ -127,7 +142,7 @@
     // Add once at module init so we don't create duplicates on repeated calls
     window.addEventListener('message', handleHandshakeMessage, false);
 
-    // Throttle resize notifications to avoid rapid firing
+    // Resize notification
     let resizeTimeout;
 
     function notifyResize() {
@@ -136,26 +151,31 @@
         }
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            let contentHeight = document.body.scrollHeight;
+            const contentHeight = Math.min(document.body.scrollHeight, MAX_CONTENT_HEIGHT);
             window.parent.postMessage({
                 type: 'reset-height',
                 height: contentHeight
             }, parentOrigin);
-        }, 100); // Debounce time in ms
+        }, RESIZE_DEBOUNCE_MS);
     }
 
-    // Call notifyResize whenever the content changes size
-    window.addEventListener('DOMContentLoaded', notifyResize, false);
+    // Fire immediately if DOM is already ready; otherwise wait for the event
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', notifyResize, false);
+    } else {
+        notifyResize();
+    }
 
-    // Watch for DOM mutations and signal resize
-    let observer = new MutationObserver(notifyResize);
-    observer.observe(document.body, {childList: true, subtree: true});
+    // Guard both observers against a missing document.body (e.g. script injected from <head>)
+    if (document.body) {
+        // Watch for DOM mutations and signal resize
+        const mutationObserver = new MutationObserver(notifyResize);
+        mutationObserver.observe(document.body, { childList: true, subtree: true });
 
-    // Watch for changes to children's size and signal resize (guard ResizeObserver)
-    if (typeof ResizeObserver !== 'undefined') {
-        let resizeObserver = new ResizeObserver(notifyResize);
-        for (const child of document.children) {
-            resizeObserver.observe(child);
+        // Watch for changes to body size and signal resize (guard ResizeObserver)
+        if (typeof ResizeObserver !== 'undefined') {
+            const resizeObserver = new ResizeObserver(notifyResize);
+            resizeObserver.observe(document.body);
         }
     }
 
