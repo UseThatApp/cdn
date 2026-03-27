@@ -8,7 +8,10 @@
     // Do not run when loaded in a top-level context
     if (window === window.parent) { return; }
 
-    const parentOrigin = "https://usethatapp.onrender.com"; // TODO: Update to www.usethatapp.com in production
+    // Parent Origin
+    const DEFAULT_ORIGIN = "https://usethatapp.onrender.com";  // TODO: change to usethatapp.com for production
+    const scriptEl = document.currentScript;
+    const parentOrigin = (scriptEl && scriptEl.getAttribute('data-parent-origin')) || DEFAULT_ORIGIN;
 
     // Constants
     const HANDSHAKE_TIMEOUT_MS = 10000; // Must stay in sync with parent app.html timeout
