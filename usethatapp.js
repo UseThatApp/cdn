@@ -25,14 +25,24 @@
     // Restore handshake flag from sessionStorage (persists across same-origin iframe navigations)
     let handshakeComplete = sessionStorage.getItem(SESSION_KEY) === '1';
 
+    // Handshake promise — resolved when the nonce exchange completes on this page load.
+    // requestAccessLevel awaits this so it never fires before the parent is ready.
+    let _handshakeResolve;
+    let _handshakePromise = new Promise(function (resolve) { _handshakeResolve = resolve; });
+
     function setHandshakeComplete(value) {
         handshakeComplete = !!value;
         sessionStorage.setItem(SESSION_KEY, handshakeComplete ? '1' : '0');
+        if (handshakeComplete && _handshakeResolve) {
+            _handshakeResolve();
+        }
     }
 
     function clearHandshake() {
         handshakeComplete = false;
         sessionStorage.removeItem(SESSION_KEY);
+        // Reset promise so the next handshake cycle can be awaited
+        _handshakePromise = new Promise(function (resolve) { _handshakeResolve = resolve; });
     }
 
     /**
@@ -41,10 +51,20 @@
      * available under `window.dash_clientside.clientside.requestAccessLevel`.
      */
     async function requestAccessLevel(...args) {
-        // If the handshake hasn't completed yet, do not attempt the request.
         // Dash expects window.dash_clientside.no_update for no change.
         var NO_UPDATE = (window.dash_clientside && window.dash_clientside.no_update) ? window.dash_clientside.no_update : undefined;
-        if (!handshakeComplete) {
+
+        // Wait for the handshake to complete on this page load instead of
+        // returning NO_UPDATE immediately.  A timeout prevents hanging forever
+        // if the parent never initiates the nonce exchange.
+        try {
+            await Promise.race([
+                _handshakePromise,
+                new Promise(function (_, reject) {
+                    setTimeout(function () { reject(new Error('Handshake wait timed out')); }, HANDSHAKE_TIMEOUT_MS);
+                })
+            ]);
+        } catch (_e) {
             return NO_UPDATE;
         }
 
