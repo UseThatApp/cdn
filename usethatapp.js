@@ -11,38 +11,59 @@
     // Parent Origin
     const DEFAULT_ORIGIN = "https://usethatapp.onrender.com";  // TODO: change to usethatapp.com for production
     const scriptEl = document.currentScript;
-    const parentOrigin = (scriptEl && scriptEl.getAttribute('data-parent-origin')) || DEFAULT_ORIGIN;
+    const rawParentOrigin = (scriptEl && scriptEl.getAttribute('data-parent-origin')) || DEFAULT_ORIGIN;
+
+    // Normalize the configured parent origin so a stray trailing slash (a
+    // common integration mistake) doesn't silently break every postMessage.
+    // MessageEvent.origin is always the bare scheme://host[:port] with no
+    // path, so we strip exactly one trailing slash if present.  Everything
+    // else (scheme, host, port, casing) is still required to match exactly.
+    const parentOrigin = rawParentOrigin.replace(/\/$/, '');
+    if (parentOrigin !== rawParentOrigin) {
+        try {
+            console.warn('[UTA child] data-parent-origin had a trailing slash; ' +
+                'using', parentOrigin, 'instead of', rawParentOrigin);
+        } catch (_) {}
+    }
+
+    // Diagnostic: announce expected parent origin once at load.  This is the
+    // single most useful piece of information when debugging a handshake
+    // timeout — if it doesn't match the origin app.html is actually served
+    // from, every message will be silently dropped by the origin check below.
+    try { console.debug('[UTA child] loaded; expecting parent origin =', parentOrigin); } catch (_) {}
 
     // Constants
     const HANDSHAKE_TIMEOUT_MS = 10000; // Must stay in sync with parent app.html timeout
     const RESIZE_DEBOUNCE_MS = 100;
     const MAX_CONTENT_HEIGHT = 10000; // Safety cap — mirrors parent MAX_RESET_HEIGHT_PX
 
-    // Handshake state
-    // Scoped key prevents collisions when multiple same-origin apps are embedded in the same tab
-    const SESSION_KEY = `handshakeComplete_${parentOrigin}`;
-
-    // Restore handshake flag from sessionStorage (persists across same-origin iframe navigations)
-    let handshakeComplete = sessionStorage.getItem(SESSION_KEY) === '1';
+    // Handshake state — per page load only.
+    // We intentionally do NOT persist this across iframe navigations: the parent
+    // re-runs the nonce handshake on every load, and persisting the flag created
+    // a race where the child would post `reset-height` before the new handshake
+    // completed (using stale state from the previous load).
+    let handshakeComplete = false;
 
     // Handshake promise — resolved when the nonce exchange completes on this page load.
     // requestAccessLevel awaits this so it never fires before the parent is ready.
     let _handshakeResolve;
     let _handshakePromise = new Promise(function (resolve) { _handshakeResolve = resolve; });
 
-    function setHandshakeComplete(value) {
-        handshakeComplete = !!value;
-        sessionStorage.setItem(SESSION_KEY, handshakeComplete ? '1' : '0');
-        if (handshakeComplete && _handshakeResolve) {
-            _handshakeResolve();
-        }
+    function setHandshakeComplete() {
+        if (handshakeComplete) { return; }
+        handshakeComplete = true;
+        if (_handshakeResolve) { _handshakeResolve(); }
+        // Static apps may never mutate the DOM after this point; force one
+        // resize report now so the parent gets the real content height.
+        notifyResize(true);
     }
 
     function clearHandshake() {
         handshakeComplete = false;
-        sessionStorage.removeItem(SESSION_KEY);
         // Reset promise so the next handshake cycle can be awaited
         _handshakePromise = new Promise(function (resolve) { _handshakeResolve = resolve; });
+        // Reset dedupe so the next handshake cycle re-reports the size
+        lastSentHeight = -1;
     }
 
     /**
@@ -135,6 +156,15 @@
      */
     function handleHandshakeMessage(event) {
         if (event.origin !== parentOrigin) {
+            // Diagnostic only — log once per unexpected origin so we don't spam.
+            if (!handleHandshakeMessage._warned) { handleHandshakeMessage._warned = {}; }
+            if (!handleHandshakeMessage._warned[event.origin]) {
+                handleHandshakeMessage._warned[event.origin] = true;
+                try {
+                    console.warn('[UTA child] ignoring postMessage from unexpected origin',
+                        event.origin, '(expected', parentOrigin + ')');
+                } catch (_) {}
+            }
             return;
         }
 
@@ -144,15 +174,17 @@
             case 'nonce':
                 // Validate nonce is a non-empty string before echoing
                 if (!msg.nonce || typeof msg.nonce !== 'string') { return; }
+                try { console.debug('[UTA child] nonce received, sending nonce-ack'); } catch (_) {}
                 // Acknowledge nonce to complete handshake
                 window.parent.postMessage({
                     type: 'nonce-ack',
                     nonce: msg.nonce
                 }, parentOrigin);
-                setHandshakeComplete(true);
+                setHandshakeComplete();
                 break;
             case 'clear-handshake':
                 // parent requested we drop the handshake flag (logout / revoke)
+                try { console.debug('[UTA child] clear-handshake received'); } catch (_) {}
                 clearHandshake();
                 break;
             default:
@@ -166,19 +198,36 @@
     window.addEventListener('message', handleHandshakeMessage, false);
 
     // Resize notification
-    let resizeTimeout;
+    let resizeTimeout = null;
+    let lastSentHeight = -1;
 
-    function notifyResize() {
+    function notifyResize(force) {
         if (!handshakeComplete) {
             return;
         }
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            const contentHeight = Math.min(document.body.scrollHeight, MAX_CONTENT_HEIGHT);
-            window.parent.postMessage({
-                type: 'reset-height',
-                height: contentHeight
-            }, parentOrigin);
+            // Use the larger of body/documentElement to handle both quirks/standards
+            // layouts.  Math.ceil avoids sub-pixel rounding producing a 1px scrollbar
+            // on some browsers.
+            const raw = Math.max(
+                document.documentElement ? document.documentElement.scrollHeight : 0,
+                document.body ? document.body.scrollHeight : 0
+            );
+            const contentHeight = Math.min(Math.ceil(raw), MAX_CONTENT_HEIGHT);
+            // Skip no-op messages.  This is the definitive break for any residual
+            // viewport-feedback loop (e.g. child uses 100vh): once layout settles
+            // the next measurement equals lastSentHeight and the chain terminates.
+            if (!force && contentHeight === lastSentHeight) {
+                return;
+            }
+            lastSentHeight = contentHeight;
+            try {
+                window.parent.postMessage({
+                    type: 'reset-height',
+                    height: contentHeight
+                }, parentOrigin);
+            } catch (_) { /* parent may have navigated away */ }
         }, RESIZE_DEBOUNCE_MS);
     }
 
