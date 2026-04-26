@@ -201,20 +201,92 @@
     let resizeTimeout = null;
     let lastSentHeight = -1;
 
+    // Sentinel element used to measure true content height without being
+    // contaminated by the iframe's own height.  scrollHeight on <html>/<body>
+    // is inflated by any descendant whose size resolves against the viewport
+    // (100vh, 100dvh, % of a vh-sized ancestor, flex/grid stretch inside
+    // such a container, etc.).  Because the parent sets the iframe's height
+    // from our reported value, those viewport units feed back into the next
+    // measurement and produce a runaway "escalator" loop until the parent's
+    // safety clamp is hit.
+    //
+    // The sentinel is a zero-size, visibility:hidden element appended as the
+    // last child of <body>.  Its bottom edge tracks where real content ends,
+    // independent of any viewport-based sizing on ancestors, so it gives a
+    // stable measurement that breaks the loop on the first cycle.
+    const SENTINEL_ID = '__uta_height_sentinel__';
+    let sentinel = null;
+
+    function ensureSentinel() {
+        if (sentinel && sentinel.isConnected) { return sentinel; }
+        if (!document.body) { return null; }
+        sentinel = document.getElementById(SENTINEL_ID);
+        if (!sentinel) {
+            sentinel = document.createElement('div');
+            sentinel.id = SENTINEL_ID;
+            sentinel.setAttribute('aria-hidden', 'true');
+            // `all: unset` neutralises any global selectors the host page
+            // might apply (e.g. `div { margin: ... }`).  The explicit rules
+            // after it lock the box to zero size and remove it from the
+            // accessibility / interaction layers.
+            sentinel.style.cssText =
+                'all: unset !important;' +
+                'display: block !important;' +
+                'height: 0 !important;' +
+                'width: 0 !important;' +
+                'margin: 0 !important;' +
+                'padding: 0 !important;' +
+                'border: 0 !important;' +
+                'visibility: hidden !important;' +
+                'pointer-events: none !important;';
+        }
+        // Always (re-)append to make sure it's the LAST child of body.  If
+        // the app re-renders and wipes body children, the MutationObserver
+        // will fire and we'll re-attach on the next notifyResize call.
+        if (sentinel.parentNode !== document.body ||
+            document.body.lastChild !== sentinel) {
+            document.body.appendChild(sentinel);
+        }
+        return sentinel;
+    }
+
+    function measureContentHeight() {
+        const s = ensureSentinel();
+        // Sentinel-based measurement: bottom of the sentinel relative to the
+        // top of the document is the true end-of-content offset.
+        let sentinelBottom = 0;
+        if (s) {
+            const rect = s.getBoundingClientRect();
+            // Add window.scrollY in case the iframe document is itself
+            // scrolled (rare, but cheap to be correct).
+            sentinelBottom = rect.bottom + (window.scrollY || 0);
+        }
+        // Fallback: classic scrollHeight.  Used when the sentinel can't be
+        // attached yet (no body) and as a floor in case the sentinel ends
+        // up inside a positioned/transformed ancestor that throws off its
+        // getBoundingClientRect (defence in depth — should not normally
+        // happen because we append directly to <body>).
+        const scroll = Math.max(
+            document.documentElement ? document.documentElement.scrollHeight : 0,
+            document.body ? document.body.scrollHeight : 0
+        );
+        // Use the SMALLER of the two non-zero values when the sentinel is
+        // available: scrollHeight may be inflated by viewport-feedback, but
+        // the sentinel can never be inflated by it.  Falling back to scroll
+        // only when the sentinel is unavailable preserves prior behaviour.
+        const raw = (s && sentinelBottom > 0)
+            ? Math.min(sentinelBottom, scroll)
+            : scroll;
+        return Math.min(Math.ceil(raw), MAX_CONTENT_HEIGHT);
+    }
+
     function notifyResize(force) {
         if (!handshakeComplete) {
             return;
         }
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
-            // Use the larger of body/documentElement to handle both quirks/standards
-            // layouts.  Math.ceil avoids sub-pixel rounding producing a 1px scrollbar
-            // on some browsers.
-            const raw = Math.max(
-                document.documentElement ? document.documentElement.scrollHeight : 0,
-                document.body ? document.body.scrollHeight : 0
-            );
-            const contentHeight = Math.min(Math.ceil(raw), MAX_CONTENT_HEIGHT);
+            const contentHeight = measureContentHeight();
             // Skip no-op messages.  This is the definitive break for any residual
             // viewport-feedback loop (e.g. child uses 100vh): once layout settles
             // the next measurement equals lastSentHeight and the chain terminates.
