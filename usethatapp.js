@@ -299,6 +299,12 @@
                     type: 'reset-height',
                     height: contentHeight
                 }, parentOrigin);
+                // Visible-by-default diagnostic so integrators can confirm
+                // which build is live and watch the height stream in real
+                // time.  Logs only the (numeric) height — no user data.
+                try {
+                    console.info('[UTA child] reset-height sent:', contentHeight, 'px');
+                } catch (_) {}
             } catch (_) { /* parent may have navigated away */ }
         }, RESIZE_DEBOUNCE_MS);
     }
