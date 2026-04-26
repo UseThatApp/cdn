@@ -240,16 +240,41 @@
 
     // Guard both observers against a missing document.body (e.g. script injected from <head>)
     if (document.body) {
-        // Watch for DOM mutations and signal resize
-        const mutationObserver = new MutationObserver(notifyResize);
-        mutationObserver.observe(document.body, { childList: true, subtree: true });
+        // Watch for any DOM change that could affect content height:
+        //   childList     — nodes added/removed
+        //   subtree       — anywhere under <body>, not just direct children
+        //   attributes    — class/style/aria changes (collapses, accordions,
+        //                   tabs, conditional CSS) often change height without
+        //                   touching the node tree
+        //   characterData — text content changes (counters, status text, etc.)
+        const mutationObserver = new MutationObserver(function () { notifyResize(); });
+        mutationObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            characterData: true
+        });
 
-        // Watch for changes to body size and signal resize (guard ResizeObserver)
+        // Watch for size changes on both <body> and <html>.  Observing only
+        // <body> misses cases where the body has a fixed/min-viewport height
+        // (common in Dash / Bootstrap defaults) while inner content — and
+        // therefore documentElement.scrollHeight — grows.
         if (typeof ResizeObserver !== 'undefined') {
-            const resizeObserver = new ResizeObserver(notifyResize);
+            const resizeObserver = new ResizeObserver(function () { notifyResize(); });
             resizeObserver.observe(document.body);
+            if (document.documentElement) {
+                resizeObserver.observe(document.documentElement);
+            }
         }
     }
+
+    // Late-arriving resources (images, web fonts, async chunks) don't generate
+    // mutation events but do change scrollHeight when they finish loading.
+    // Force a fresh report on window 'load' to catch them.
+    window.addEventListener('load', function () { notifyResize(true); }, false);
+
+    // Viewport changes can affect responsive layouts inside the iframe.
+    window.addEventListener('resize', function () { notifyResize(); }, false);
 
     // NOTE: do not clear the handshake on unload/pagehide here.
     // The parent can explicitly send `clear-handshake` when it wants the child to drop the flag.
